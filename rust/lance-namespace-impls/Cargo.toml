@@ -15,10 +15,10 @@ rust-version.workspace = true
 default = []
 rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
 # Cloud storage features for directory implementation - align with lance-io
-dir-gcp = ["lance-io/gcp"]
-dir-aws = ["lance-io/aws"]
-dir-azure = ["lance-io/azure"]
-dir-oss = ["lance-io/oss"]
+dir-gcp = ["lance-io/gcp", "lance/gcp"]
+dir-aws = ["lance-io/aws", "lance/aws"]
+dir-azure = ["lance-io/azure", "lance/azure"]
+dir-oss = ["lance-io/oss", "lance/oss"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -31,7 +31,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "gzip",
     "http2",
     "stream",
-    "rustls-tls-native-roots"
+    "rustls-tls-native-roots",
 ] }
 serde_json = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

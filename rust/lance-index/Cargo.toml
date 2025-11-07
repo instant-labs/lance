@@ -40,6 +40,7 @@ lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
+lance-io.default-features = false
 lance-linalg.workspace = true
 lance-table.workspace = true
 libm.workspace = true

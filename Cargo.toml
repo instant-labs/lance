@@ -48,7 +48,7 @@ rust-version = "1.82.0"
 
 [workspace.dependencies]
 libc = "0.2.176"
-lance = { version = "=0.39.0", path = "./rust/lance" }
+lance = { version = "=0.39.0", path = "./rust/lance", default-features = false }
 lance-arrow = { version = "=0.39.0", path = "./rust/lance-arrow" }
 lance-core = { version = "=0.39.0", path = "./rust/lance-core" }
 lance-datafusion = { version = "=0.39.0", path = "./rust/lance-datafusion" }
@@ -59,7 +59,7 @@ lance-index = { version = "=0.39.0", path = "./rust/lance-index" }
 lance-io = { version = "=0.39.0", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=0.39.0", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=0.39.0", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=0.39.0", path = "./rust/lance-namespace-impls" }
+lance-namespace-impls = { version = "=0.39.0", path = "./rust/lance-namespace-impls", default-features = false }
 lance-namespace-reqwest-client = "0.0.18"
 lance-table = { version = "=0.39.0", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.39.0", path = "./rust/lance-test-macros" }
@@ -133,7 +133,7 @@ humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.8.1", default-features = false }
-jsonb = { version = "0.5.3", default-features = false, features = ["databend"]}
+jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
 mockall = { version = "0.13.1" }
@@ -141,7 +141,7 @@ mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
-object_store = { version = "0.12.3" }
+object_store = { version = "0.12.3", default-features = false }
 opendal = { version = "0.54" }
 object_store_opendal = { version = "0.54" }
 pin-project = "1.0"
