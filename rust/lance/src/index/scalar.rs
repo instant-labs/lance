@@ -37,7 +37,7 @@ use lance_index::scalar::label_list::{
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
+use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
     lance_format::LanceIndexStore,
@@ -281,6 +281,24 @@ pub(super) async fn build_scalar_index(
             format!("No column with name {}", column).into(),
         ))?;
     let field: arrow_schema::Field = field.into();
+
+    // Only bitmap scalar indexes are supported on dictionary-encoded columns.
+    // A btree index in particular fails to write its per-page null min/max stats
+    // for a dictionary column (the encoder rejects the empty-values dictionary
+    // array produced for a null bound), so reject non-bitmap types up front with
+    // a clear error instead of crashing mid-build.
+    if matches!(field.data_type(), DataType::Dictionary(..))
+        && params.index_type != BuiltinIndexType::Bitmap.as_str()
+    {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Scalar index type '{}' is not supported on dictionary-encoded column '{}'; \
+                 only bitmap indexes are supported.",
+                params.index_type, column
+            )
+            .into(),
+        ));
+    }
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
 

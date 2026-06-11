@@ -8309,6 +8309,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(count, 20);
     }
 
+    /// Only bitmap scalar indexes are supported on dictionary-encoded columns.
+    /// A btree index must be rejected up front with a clear error rather than
+    /// crashing while writing its null min/max stats.
+    #[tokio::test]
+    async fn test_btree_on_dictionary_column_is_rejected() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let mut dataset = dictionary_string_dataset().await;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let err = dataset
+            .create_index(&["etld"], IndexType::Scalar, None, &params, true)
+            .await
+            .expect_err("btree on a dictionary column should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only bitmap indexes are supported") && msg.contains("dictionary-encoded"),
+            "unexpected error message: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_like_prefix_with_segmented_zone_map() {
         use lance_index::scalar::BuiltinIndexType;
