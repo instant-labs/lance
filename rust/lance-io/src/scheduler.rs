@@ -1686,4 +1686,184 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_dispatched.load(Ordering::Acquire), 30);
     }
+
+    /// A Reader whose `get_range` blocks until a semaphore permit is released.
+    ///
+    /// This lets a test control exactly when an in-flight IoTask completes, so it
+    /// can drop the caller-side future while the underlying read is still pending.
+    #[derive(Debug)]
+    struct BlockingReader {
+        semaphore: Arc<tokio::sync::Semaphore>,
+        get_range_count: Arc<AtomicU64>,
+        path: Path,
+    }
+
+    impl deepsize::DeepSizeOf for BlockingReader {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for BlockingReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(1_000_000) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.get_range_count.fetch_add(1, Ordering::Release);
+            let semaphore = self.semaphore.clone();
+            let num_bytes = range.end - range.start;
+            Box::pin(async move {
+                // Block until the test releases a permit, so the caller can drop
+                // its future before this read (and thus the IoTask) completes.
+                semaphore.acquire().await.unwrap().forget();
+                Ok(Bytes::from(vec![0u8; num_bytes]))
+            })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
+        }
+    }
+
+    /// Runs the caller-side cancellation scenario against either scheduler and
+    /// reports whether the follow-up request eventually completes.
+    ///
+    /// The scenario, against a 100-byte backpressure budget:
+    ///
+    /// 1. Submit `fut1` (50 bytes, priority 0). The scheduler reserves 50 of the
+    ///    100 available bytes and dispatches the read, which blocks inside
+    ///    `get_range`.
+    /// 2. Drop `fut1` while that read is still pending (its `rx` never resolves).
+    /// 3. Release the read so the server-side task runs to completion.
+    /// 4. Submit `fut2` (60 bytes, priority 1). Priority 1 is strictly lower than
+    ///    the (still in-flight from the scheduler's view) priority 0, so the
+    ///    priority-bypass path cannot admit it -- only the byte budget can. With
+    ///    50 bytes still reserved, only 50 of 100 remain, so `fut2` can proceed
+    ///    only if the dropped request's reservation was refunded.
+    ///
+    /// Returns `(completed, elapsed)` where `completed` is `true` if `fut2`
+    /// finished within a 2 second window and `false` if it deadlocked.
+    async fn run_caller_drop_scenario(use_lite_scheduler: bool) -> (bool, Duration) {
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(4096),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        let scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 100,
+                use_lite_scheduler: Some(use_lite_scheduler),
+            },
+        );
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: semaphore.clone(),
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        // Step 1: reserve 50 of the 100 budget bytes with a read we never consume.
+        // Spawn it so we can cancel the caller-side future while it is still parked
+        // waiting for the (blocked) read to finish.
+        let fut1 = scheduler.submit_request(reader.clone(), vec![0..50], 0, false);
+        let handle = tokio::spawn(async move {
+            let _ = fut1.await;
+        });
+
+        // Wait until the read is genuinely in flight (blocked on the semaphore).
+        // This guarantees the 50-byte reservation has been taken before we drop
+        // the caller, closing the race between the I/O loop and the abort.
+        while get_range_count.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Step 2: drop the caller-side future while its `rx` is still pending.
+        handle.abort();
+        let _ = handle.await;
+
+        // Step 3: let the in-flight read finish. In the standard scheduler the
+        // server-side task now completes and its `tx.send` fails silently (the
+        // receiver was dropped in step 2), so the 50-byte reservation is never
+        // refunded.
+        semaphore.add_permits(1);
+        // Give the server-side task time to run to completion so any refund would
+        // already have happened.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Step 4: submit the follow-up. Add a permit up front so that, if it *is*
+        // admitted, its own read can complete rather than block on the semaphore.
+        semaphore.add_permits(1);
+        let fut2 = scheduler.submit_request(reader, vec![100..160], 1, false);
+
+        let start = std::time::Instant::now();
+        let outcome = timeout(Duration::from_secs(2), fut2).await;
+        let elapsed = start.elapsed();
+        match outcome {
+            Ok(res) => {
+                assert_eq!(res.unwrap().iter().map(|b| b.len()).sum::<usize>(), 60);
+                (true, elapsed)
+            }
+            Err(_) => (false, elapsed),
+        }
+    }
+
+    /// The standard scheduler refunds the backpressure reservation only when the
+    /// caller polls the returned future to completion (via the `.map` closure that
+    /// calls `on_bytes_consumed`). If the caller drops that future while the read
+    /// is still in flight, the reservation is leaked and a later request that
+    /// would exceed the leaked-down budget deadlocks forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn standard_scheduler_leaks_bytes_avail_on_caller_drop() {
+        let (completed, elapsed) = run_caller_drop_scenario(false).await;
+        assert!(
+            !completed,
+            "standard scheduler unexpectedly completed the follow-up request in {elapsed:?}; \
+             the caller-drop reservation leak did not reproduce"
+        );
+    }
+
+    /// The lite scheduler leaks the reservation on caller drop just like the
+    /// standard scheduler, though via a different mechanism. It keeps the
+    /// in-flight `IoTask` (and its `BackpressureReservation`) inside
+    /// `IoQueueState.tasks`, and only releases the reservation in `IoQueue::poll`
+    /// when the task reaches `Finished`. `TaskHandle` has no `Drop` impl, so
+    /// aborting the caller leaves the task stranded in `Running` state with its
+    /// reservation held until the scheduler itself is dropped -- and even then
+    /// `close()`/`cancel()` overwrite the task state without calling `release()`.
+    /// A later request that would exceed the leaked-down budget therefore
+    /// deadlocks, exactly as with the standard scheduler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lite_scheduler_also_leaks_bytes_avail_on_caller_drop() {
+        let (completed, elapsed) = run_caller_drop_scenario(true).await;
+        assert!(
+            !completed,
+            "lite scheduler unexpectedly completed the follow-up request in {elapsed:?}; \
+             the caller-drop reservation leak did not reproduce"
+        );
+    }
 }
