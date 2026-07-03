@@ -268,6 +268,9 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
+    // Queue the batch's backpressure reservation is refunded to once its response
+    // is delivered or discarded (see `Response`'s `Drop`).
+    io_queue: Arc<IoQueue>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
@@ -277,6 +280,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         priority: u128,
         num_reqs: usize,
         bypass_backpressure: bool,
+        io_queue: Arc<IoQueue>,
     ) -> Self {
         Self {
             when_done: Some(when_done),
@@ -286,6 +290,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             num_reqs,
             err: None,
             bypass_backpressure,
+            io_queue,
         }
     }
 }
@@ -307,7 +312,8 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
         let response = Response {
-            data: result,
+            data: Some(result),
+            io_queue: self.io_queue.clone(),
             // Report 0 bytes for bypass tasks so the backpressure budget is unaffected
             num_bytes: if self.bypass_backpressure {
                 0
@@ -521,10 +527,23 @@ impl Debug for ScanScheduler {
 }
 
 struct Response {
-    data: Result<Vec<Bytes>>,
+    // `Option` so the caller can take the data out while the response (and its
+    // backpressure refund on drop) stays intact.
+    data: Option<Result<Vec<Bytes>>>,
+    io_queue: Arc<IoQueue>,
     priority: u128,
     num_reqs: usize,
     num_bytes: u64,
+}
+
+// Refund the batch's backpressure reservation when the response is dropped, be
+// that on delivery or when a cancelled request's undelivered response is
+// discarded.  This releases the budget even if the caller drops the future early.
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.io_queue
+            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -682,6 +701,7 @@ impl ScanScheduler {
             priority,
             request.len(),
             bypass_backpressure,
+            io_queue.clone(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
@@ -720,14 +740,11 @@ impl ScanScheduler {
 
         self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
 
-        let io_queue_clone = io_queue.clone();
-
-        rx.map(move |wrapped_rsp| {
-            // Right now, it isn't possible for I/O to be cancelled so a cancel error should
-            // not occur
-            let rsp = wrapped_rsp.unwrap();
-            io_queue_clone.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
-            rsp.data
+        rx.map(|wrapped_rsp| {
+            // A cancel error can't occur: the sender always sends before dropping.
+            // The reservation is refunded on `Response` drop, so just take the data.
+            let mut rsp = wrapped_rsp.unwrap();
+            rsp.data.take().unwrap()
         })
     }
 
@@ -1741,24 +1758,11 @@ mod tests {
         }
     }
 
-    /// Runs the caller-side cancellation scenario against either scheduler and
-    /// reports whether the follow-up request eventually completes.
-    ///
-    /// The scenario, against a 100-byte backpressure budget:
-    ///
-    /// 1. Submit `fut1` (50 bytes, priority 0). The scheduler reserves 50 of the
-    ///    100 available bytes and dispatches the read, which blocks inside
-    ///    `get_range`.
-    /// 2. Drop `fut1` while that read is still pending (its `rx` never resolves).
-    /// 3. Release the read so the server-side task runs to completion.
-    /// 4. Submit `fut2` (60 bytes, priority 1). Priority 1 is strictly lower than
-    ///    the (still in-flight from the scheduler's view) priority 0, so the
-    ///    priority-bypass path cannot admit it -- only the byte budget can. With
-    ///    50 bytes still reserved, only 50 of 100 remain, so `fut2` can proceed
-    ///    only if the dropped request's reservation was refunded.
-    ///
-    /// Returns `(completed, elapsed)` where `completed` is `true` if `fut2`
-    /// finished within a 2 second window and `false` if it deadlocked.
+    // Against a 100-byte budget: submit fut1 (50 bytes, priority 0), drop it while
+    // its read is still blocked in get_range, then submit fut2 (60 bytes, priority 1).
+    // fut2's priority can't win the priority-bypass, so it needs 60 of the budget --
+    // available only if fut1's dropped reservation was refunded. Returns whether fut2
+    // completed within 2s (false = the reservation leaked and fut2 deadlocked).
     async fn run_caller_drop_scenario(use_lite_scheduler: bool) -> (bool, Duration) {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(InMemory::new()),
@@ -1806,13 +1810,11 @@ mod tests {
         handle.abort();
         let _ = handle.await;
 
-        // Step 3: let the in-flight read finish. In the standard scheduler the
-        // server-side task now completes and its `tx.send` fails silently (the
-        // receiver was dropped in step 2), so the 50-byte reservation is never
-        // refunded.
+        // Step 3: let the in-flight read finish. The reservation should be refunded
+        // now that the request is done, whether or not the caller is still around.
         semaphore.add_permits(1);
-        // Give the server-side task time to run to completion so any refund would
-        // already have happened.
+        // Give the read time to run to completion so the refund would already have
+        // happened.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Step 4: submit the follow-up. Add a permit up front so that, if it *is*
@@ -1832,38 +1834,28 @@ mod tests {
         }
     }
 
-    /// The standard scheduler refunds the backpressure reservation only when the
-    /// caller polls the returned future to completion (via the `.map` closure that
-    /// calls `on_bytes_consumed`). If the caller drops that future while the read
-    /// is still in flight, the reservation is leaked and a later request that
-    /// would exceed the leaked-down budget deadlocks forever.
+    /// Dropping a standard-scheduler request future while its read is in flight must
+    /// still refund the backpressure reservation, so a later request that needs the
+    /// budget does not deadlock.
     #[tokio::test(flavor = "multi_thread")]
-    async fn standard_scheduler_leaks_bytes_avail_on_caller_drop() {
+    async fn standard_scheduler_refunds_reservation_on_caller_drop() {
         let (completed, elapsed) = run_caller_drop_scenario(false).await;
         assert!(
-            !completed,
-            "standard scheduler unexpectedly completed the follow-up request in {elapsed:?}; \
-             the caller-drop reservation leak did not reproduce"
+            completed,
+            "standard scheduler deadlocked the follow-up request (elapsed {elapsed:?}); \
+             the dropped request's reservation was not refunded"
         );
     }
 
-    /// The lite scheduler leaks the reservation on caller drop just like the
-    /// standard scheduler, though via a different mechanism. It keeps the
-    /// in-flight `IoTask` (and its `BackpressureReservation`) inside
-    /// `IoQueueState.tasks`, and only releases the reservation in `IoQueue::poll`
-    /// when the task reaches `Finished`. `TaskHandle` has no `Drop` impl, so
-    /// aborting the caller leaves the task stranded in `Running` state with its
-    /// reservation held until the scheduler itself is dropped -- and even then
-    /// `close()`/`cancel()` overwrite the task state without calling `release()`.
-    /// A later request that would exceed the leaked-down budget therefore
-    /// deadlocks, exactly as with the standard scheduler.
+    /// Same guarantee for the lite scheduler: dropping a request future mid-read
+    /// releases its reservation via the `TaskHandle` drop path.
     #[tokio::test(flavor = "multi_thread")]
-    async fn lite_scheduler_also_leaks_bytes_avail_on_caller_drop() {
+    async fn lite_scheduler_refunds_reservation_on_caller_drop() {
         let (completed, elapsed) = run_caller_drop_scenario(true).await;
         assert!(
-            !completed,
-            "lite scheduler unexpectedly completed the follow-up request in {elapsed:?}; \
-             the caller-drop reservation leak did not reproduce"
+            completed,
+            "lite scheduler deadlocked the follow-up request (elapsed {elapsed:?}); \
+             the dropped request's reservation was not refunded"
         );
     }
 }
