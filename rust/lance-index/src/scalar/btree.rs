@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -28,8 +28,17 @@ use crate::{
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
-use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_array::{
+    Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
+    cast::AsArray,
+    new_empty_array,
+    types::{
+        ArrowPrimitiveType, Decimal128Type, Decimal256Type, Float16Type, Float32Type, Float64Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    },
+};
+use arrow_ord::ord::make_comparator;
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
@@ -614,27 +623,121 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
     }
 }
 
+/// Returns the first index `i` in `[lo, hi)` for which `pred(i)` is `false`.
+///
+/// `pred` must be `true` for a (possibly empty) prefix of the range and `false`
+/// for the rest, i.e. the range is partitioned by `pred`.
+fn partition_point(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
+    let mut lo = lo;
+    let mut hi = hi;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Builds a comparator over two array accessors of the same `Ord` item type,
+/// matching arrow's NULLs-first ascending order (`null < non-null`, `null == null`).
+///
+/// Unlike [`make_comparator`], the returned closure is generic (not boxed), so the
+/// element comparison inlines into the scan instead of dispatching through a vtable
+/// on every call.
+fn accessor_cmp<'a, T, L, R>(left: L, right: R) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: Ord,
+    L: ArrayAccessor<Item = T> + 'a,
+    R: ArrayAccessor<Item = T> + 'a,
+{
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.value(i).cmp(&right.value(j)),
+    }
+}
+
+/// Views `arr` as `PrimitiveArray<K>` for comparison. Zero-copy (shared buffers)
+/// when `arr` already has type `K`; otherwise — a logical type whose physical
+/// storage is `K::Native`, e.g. `Date32`/`Time32` over `i32` or `Timestamp`/
+/// `Duration` over `i64` — the array data is relabeled to `K` without copying the
+/// values, so all such logical types share one comparison path.
+fn reinterpret_primitive<K: ArrowPrimitiveType>(arr: &dyn Array) -> Result<PrimitiveArray<K>> {
+    if let Some(arr) = arr.as_primitive_opt::<K>() {
+        return Ok(arr.clone());
+    }
+    let data = arr
+        .to_data()
+        .into_builder()
+        .data_type(K::DATA_TYPE)
+        .build()
+        .map_err(|e| {
+            Error::internal(format!(
+                "failed to reinterpret {} as {}: {e}",
+                arr.data_type(),
+                K::DATA_TYPE
+            ))
+        })?;
+    Ok(PrimitiveArray::<K>::from(data))
+}
+
+/// Like [`accessor_cmp`] but for primitive columns, comparing native values with
+/// [`ArrowNativeTypeOp::compare`] (total order, so floats match arrow's NaN-last
+/// `make_comparator` ordering).
+fn primitive_cmp<'a, T>(
+    left: &'a PrimitiveArray<T>,
+    right: &'a PrimitiveArray<T>,
+) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: ArrowPrimitiveType,
+{
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.value(i).compare(right.value(j)),
+    }
+}
+
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
+///
+/// Range queries walk the `tree`. Equality / `IN` lookups search the retained
+/// `page_lookup.lance` batch directly via `candidate_pages_for_values`, which
+/// dispatches on the query's *physical storage type* to a monomorphized, inlined
+/// comparator: numerics go through `scan_native` (logical types sharing a native —
+/// e.g. `Date32` and `Int32` — fold to one path), byte-likes through
+/// `scan_accessor`. Only types without a native fast path (struct-backed
+/// intervals, booleans) fall back to the boxed [`make_comparator`] via
+/// `scan_fallback`.
+#[derive(Debug, PartialEq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
+    /// One row per page (`min | max | null_count | page_idx`), sorted ascending by
+    /// `min` with NULLs first (the order the index is trained in).
+    batch: RecordBatch,
+    /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
+    /// the front (NULLs first) and are skipped when searching value ranges.
+    search_start: usize,
     /// Pages where the value may be null (does not include all_null_pages)
     null_pages: Vec<u32>,
     /// Pages that are entirely null
     all_null_pages: Vec<u32>,
 }
 
-impl BTreeLookup {
-    fn empty() -> Self {
-        Self {
-            tree: BTreeMap::new(),
-            null_pages: Vec::new(),
-            all_null_pages: Vec::new(),
-        }
+impl DeepSizeOf for BTreeLookup {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.tree.deep_size_of_children(context)
+            + self.batch.get_array_memory_size()
+            + self.null_pages.deep_size_of_children(context)
+            + self.all_null_pages.deep_size_of_children(context)
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Matches {
     Some(u32),
     All(u32),
@@ -650,47 +753,339 @@ impl Matches {
 }
 
 impl BTreeLookup {
-    fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
-        all_null_pages: Vec<u32>,
-    ) -> Self {
-        Self {
+    /// Build a lookup over the `page_lookup.lance` batch. The batch is retained so
+    /// equality / `IN` searches can compare against the `min`/`max` columns
+    /// directly; the tree serves range queries.
+    fn try_new(batch: RecordBatch) -> Result<Self> {
+        let mut tree = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
+        // Pages that have at least one null value
+        let mut null_pages = Vec::<u32>::new();
+        // Pages that are entirely null
+        let mut all_null_pages = Vec::<u32>::new();
+        let mut search_start = batch.num_rows();
+
+        if batch.num_rows() > 0 {
+            let mins = batch.column(0);
+            let maxs = batch.column(1);
+            let null_counts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::internal("BTree lookup null_count column must be UInt32"))?;
+            let page_numbers = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))?;
+
+            for idx in 0..batch.num_rows() {
+                let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
+                let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
+                let null_count = null_counts.values()[idx];
+                let page_number = page_numbers.values()[idx];
+
+                // If the page is entirely null don't even bother putting it in the tree
+                if max.0.is_null() {
+                    all_null_pages.push(page_number);
+                    // continue so we don't add it to the null_pages
+                    continue;
+                } else {
+                    if search_start == batch.num_rows() {
+                        search_start = idx;
+                    }
+                    tree.entry(min)
+                        .or_default()
+                        .push(PageRecord { max, page_number });
+                }
+
+                if null_count > 0 {
+                    null_pages.push(page_number);
+                }
+            }
+
+            let last_max = ScalarValue::try_from_array(&maxs, batch.num_rows() - 1)?;
+            tree.entry(OrderableScalarValue(last_max)).or_default();
+        } else {
+            search_start = 0;
+        }
+
+        Ok(Self {
             tree,
+            batch,
+            search_start,
             null_pages,
             all_null_pages,
-        }
+        })
+    }
+
+    fn page_numbers(&self) -> Result<&UInt32Array> {
+        self.batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))
     }
 
     // All pages that could have a value equal to val
-    fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<Matches> {
+    fn pages_eq(&self, query: &OrderableScalarValue) -> Result<Vec<Matches>> {
         if query.0.is_null() {
-            self.pages_null()
+            Ok(self.pages_null())
         } else {
-            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+            let query_arr = query.0.to_array_of_size(1)?;
+            let pages = self.candidate_pages_for_values(query_arr.as_ref())?;
+            Ok(pages.into_iter().map(Matches::Some).collect())
         }
     }
 
     // All pages that could have a value equal to one of the values
-    fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<Matches> {
-        // TODO: Right now we convert all Matches::All into Matches::Some.  We could refine this.
-        // It would improve performance on low cardinality data.
-        let page_lists = values
-            .into_iter()
-            .map(|val| {
-                self.pages_eq(&val)
-                    .into_iter()
-                    .map(|matches| matches.page_id())
-            })
-            .collect::<Vec<_>>();
-        let total_size = page_lists.iter().map(|set| set.len()).sum();
-        let mut heap = BinaryHeap::with_capacity(total_size);
-        for page_list in page_lists {
-            heap.extend(page_list);
+    fn pages_in(
+        &self,
+        values: impl IntoIterator<Item = OrderableScalarValue>,
+    ) -> Result<Vec<Matches>> {
+        // Equality lookups never produce a full-page (`Matches::All`) match because a
+        // single value cannot cover an entire page's range, so every candidate is
+        // `Matches::Some`. TODO: refining this would improve performance on low
+        // cardinality data.
+        let values = values.into_iter();
+        let mut has_null = false;
+        let mut non_null = Vec::with_capacity(values.size_hint().0);
+        for val in values {
+            if val.0.is_null() {
+                has_null = true;
+            } else {
+                non_null.push(val.0);
+            }
         }
-        let mut all_pages = heap.into_sorted_vec();
+
+        // Build a single array holding every queried value so the comparators are
+        // constructed once and reused across all of them, rather than per value.
+        let mut all_pages = if non_null.is_empty() {
+            Vec::new()
+        } else {
+            let query_arr = ScalarValue::iter_to_array(non_null)?;
+            self.candidate_pages_for_values(query_arr.as_ref())?
+        };
+        if has_null {
+            all_pages.extend(self.pages_null().into_iter().map(|m| m.page_id()));
+        }
+        all_pages.sort_unstable();
         all_pages.dedup();
-        all_pages.into_iter().map(Matches::Some).collect()
+        Ok(all_pages.into_iter().map(Matches::Some).collect())
+    }
+
+    /// Candidate page numbers (deduped, ascending) for an equality search against
+    /// every value in `query`. A page is a candidate when its `[min, max]` range
+    /// could contain the value, i.e. `min <= value <= max`.
+    ///
+    /// The comparators are built once over the whole `query` array and reused for
+    /// each value, so an N-value `IN` costs three comparator constructions instead
+    /// of three per value.
+    fn candidate_pages_for_values(&self, query: &dyn Array) -> Result<Vec<u32>> {
+        let num_rows = self.batch.num_rows();
+        if self.search_start >= num_rows || query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mins = self.batch.column(0).as_ref();
+        let maxs = self.batch.column(1).as_ref();
+        let page_ids = self.page_numbers()?.values();
+
+        // Compare against the page columns with a native, monomorphized comparator
+        // that inlines, rather than the boxed `DynComparator` from `make_comparator`
+        // (one vtable call per comparison). Logical types that share a physical
+        // storage type route to one path via a zero-copy reinterpret, so e.g. every
+        // date/time/timestamp/duration type reuses the `i32`/`i64` path instead of
+        // generating its own. Types with no native path (intervals with struct
+        // natives, booleans, ...) take the `make_comparator` fallback. The query
+        // array always matches the column type, so its type selects the branch.
+        use DataType::*;
+        match query.data_type() {
+            Int8 => self.scan_native::<Int8Type>(mins, maxs, query, page_ids),
+            Int16 => self.scan_native::<Int16Type>(mins, maxs, query, page_ids),
+            // i32-backed: Int32, Date32, Time32, Decimal32, year-month intervals.
+            Int32 | Date32 | Time32(_) | Decimal32(_, _) | Interval(IntervalUnit::YearMonth) => {
+                self.scan_native::<Int32Type>(mins, maxs, query, page_ids)
+            }
+            // i64-backed: Int64, Date64, Time64, Timestamp, Duration, Decimal64.
+            Int64 | Date64 | Time64(_) | Timestamp(_, _) | Duration(_) | Decimal64(_, _) => {
+                self.scan_native::<Int64Type>(mins, maxs, query, page_ids)
+            }
+            UInt8 => self.scan_native::<UInt8Type>(mins, maxs, query, page_ids),
+            UInt16 => self.scan_native::<UInt16Type>(mins, maxs, query, page_ids),
+            UInt32 => self.scan_native::<UInt32Type>(mins, maxs, query, page_ids),
+            UInt64 => self.scan_native::<UInt64Type>(mins, maxs, query, page_ids),
+            Float16 => self.scan_native::<Float16Type>(mins, maxs, query, page_ids),
+            Float32 => self.scan_native::<Float32Type>(mins, maxs, query, page_ids),
+            Float64 => self.scan_native::<Float64Type>(mins, maxs, query, page_ids),
+            Decimal128(_, _) => self.scan_native::<Decimal128Type>(mins, maxs, query, page_ids),
+            Decimal256(_, _) => self.scan_native::<Decimal256Type>(mins, maxs, query, page_ids),
+            Utf8 => Ok(self.scan_accessor(
+                mins.as_string::<i32>(),
+                maxs.as_string::<i32>(),
+                query.as_string::<i32>(),
+                page_ids,
+            )),
+            LargeUtf8 => Ok(self.scan_accessor(
+                mins.as_string::<i64>(),
+                maxs.as_string::<i64>(),
+                query.as_string::<i64>(),
+                page_ids,
+            )),
+            Binary => Ok(self.scan_accessor(
+                mins.as_binary::<i32>(),
+                maxs.as_binary::<i32>(),
+                query.as_binary::<i32>(),
+                page_ids,
+            )),
+            LargeBinary => Ok(self.scan_accessor(
+                mins.as_binary::<i64>(),
+                maxs.as_binary::<i64>(),
+                query.as_binary::<i64>(),
+                page_ids,
+            )),
+            FixedSizeBinary(_) => Ok(self.scan_accessor(
+                mins.as_fixed_size_binary(),
+                maxs.as_fixed_size_binary(),
+                query.as_fixed_size_binary(),
+                page_ids,
+            )),
+            _ => self.scan_fallback(mins, maxs, query, page_ids),
+        }
+    }
+
+    /// Native-comparator equality scan for a primitive physical type `K`. The page
+    /// columns and `query` are reinterpreted to `PrimitiveArray<K>` (zero-copy when
+    /// already that type) and compared with [`primitive_cmp`].
+    fn scan_native<K: ArrowPrimitiveType>(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let mins = reinterpret_primitive::<K>(mins)?;
+        let maxs = reinterpret_primitive::<K>(maxs)?;
+        let query = reinterpret_primitive::<K>(query)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            primitive_cmp(&mins, &query),
+            primitive_cmp(&maxs, &query),
+            primitive_cmp(&mins, &mins),
+        ))
+    }
+
+    /// Native-comparator equality scan for byte-like columns (`Utf8`/`Binary`/
+    /// `FixedSizeBinary` and their large variants), compared lexicographically via
+    /// [`accessor_cmp`].
+    fn scan_accessor<T, A>(&self, mins: A, maxs: A, query: A, page_ids: &[u32]) -> Vec<u32>
+    where
+        T: Ord,
+        A: ArrayAccessor<Item = T> + Copy,
+    {
+        self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            accessor_cmp(mins, query),
+            accessor_cmp(maxs, query),
+            accessor_cmp(mins, mins),
+        )
+    }
+
+    /// Fallback equality scan for types without a native path (intervals with struct
+    /// natives, booleans, ...), using arrow's boxed `make_comparator`.
+    fn scan_fallback(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        // The batch is sorted ascending by `min` with NULLs first; compare the query
+        // values the same way so the binary searches stay consistent.
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let cmp_min = make_comparator(mins, query, opts)?;
+        let cmp_max = make_comparator(maxs, query, opts)?;
+        let cmp_min_min = make_comparator(mins, mins, opts)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            cmp_min,
+            cmp_max,
+            cmp_min_min,
+        ))
+    }
+
+    /// Binary-search + forward-scan the page batch for equality candidates.
+    ///
+    /// Monomorphized over the comparator closures so a typed-native comparator
+    /// inlines (no per-call vtable dispatch). The closures encode NULLs-first,
+    /// ascending order:
+    ///   * `max_is_null(i)` — whether page `i`'s `max` is null (an all-null page)
+    ///   * `cmp_min(i, j)` — page `i`'s `min` vs query value `j`
+    ///   * `cmp_max(i, j)` — page `i`'s `max` vs query value `j`
+    ///   * `cmp_min_min(i, anchor)` — two page `min`s, to expand left onto a straddle
+    fn scan_equality_pages(
+        &self,
+        num_query: usize,
+        page_ids: &[u32],
+        max_is_null: impl Fn(usize) -> bool,
+        cmp_min: impl Fn(usize, usize) -> Ordering,
+        cmp_max: impl Fn(usize, usize) -> Ordering,
+        cmp_min_min: impl Fn(usize, usize) -> Ordering,
+    ) -> Vec<u32> {
+        let num_rows = self.batch.num_rows();
+        // High-cardinality lookups hit ~one page per value; presize to avoid the
+        // element-by-element `RawVec` growth that profiling flagged.
+        let mut pages = Vec::with_capacity(num_query);
+        for j in 0..num_query {
+            // Start row: peek a little to the left of the value. A query for 7 must
+            // still reach a page like [5, 10], so we include every page whose `min`
+            // equals the largest `min` strictly less than the value.
+            let p = partition_point(0, num_rows, |i| cmp_min(i, j) == Ordering::Less);
+            let start = if p == 0 {
+                self.search_start
+            } else {
+                let anchor = p - 1;
+                partition_point(0, p, |i| cmp_min_min(i, anchor) == Ordering::Less)
+            }
+            .max(self.search_start);
+
+            // End row: pages whose `min` exceeds the value cannot match.
+            let end = partition_point(start, num_rows, |i| cmp_min(i, j) != Ordering::Greater);
+
+            // The window splits at `p` (first row with `min >= value`):
+            //   * `[start, p)` — the peek-left/straddle region (`min < value`). A page
+            //     here matches only if its `max` reaches the value, so it needs the
+            //     filter, and it may include a null-`min`/null-`max` straddle page.
+            //   * `[p, end)` — rows with `min == value`. These always match (`max >=
+            //     min == value`) and can't have a null `max` (all-null pages sort to
+            //     the front, before `search_start <= start`), so we copy them in one
+            //     slice instead of pushing per row.
+            let bulk_start = p.max(start);
+            for (offset, &page_id) in page_ids[start..bulk_start].iter().enumerate() {
+                let idx = start + offset;
+                // All-null pages are only matched by IS NULL queries.
+                if max_is_null(idx) {
+                    continue;
+                }
+                // Candidate when the page's `max` reaches the value (`max >= value`).
+                if cmp_max(idx, j) != Ordering::Less {
+                    pages.push(page_id);
+                }
+            }
+            pages.extend_from_slice(&page_ids[bulk_start..end]);
+        }
+
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
     // All pages that could have a value in the range
@@ -1160,72 +1555,13 @@ impl BTreeIndex {
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
-        // Pages that have at least one null value
-        let mut null_pages = Vec::<u32>::new();
-        // Pages that are entirely null
-        let mut all_null_pages = Vec::<u32>::new();
-
-        if data.num_rows() == 0 {
-            let data_type = data.column(0).data_type().clone();
-            let page_lookup = Arc::new(BTreeLookup::empty());
-            return Ok(Self::new(
-                page_lookup,
-                store,
-                data_type,
-                WeakLanceCache::from(index_cache),
-                batch_size,
-                ranges_to_files,
-                frag_reuse_index,
-            ));
-        }
-
-        let mins = data.column(0);
-        let maxs = data.column(1);
-        let null_counts = data
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let page_numbers = data
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-
-        for idx in 0..data.num_rows() {
-            let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
-            let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
-            let null_count = null_counts.values()[idx];
-            let page_number = page_numbers.values()[idx];
-
-            // If the page is entirely null don't even bother putting it in the tree
-            if max.0.is_null() {
-                all_null_pages.push(page_number);
-                // continue so we don't add it to the null_pages
-                continue;
-            } else {
-                map.entry(min)
-                    .or_default()
-                    .push(PageRecord { max, page_number });
-            }
-
-            if null_count > 0 {
-                null_pages.push(page_number);
-            }
-        }
-
-        let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
-        map.entry(OrderableScalarValue(last_max)).or_default();
-
-        let data_type = mins.data_type();
-
-        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
+        let data_type = data.column(0).data_type().clone();
+        let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
         Ok(Self::new(
             page_lookup,
             store,
-            data_type.clone(),
+            data_type,
             WeakLanceCache::from(index_cache),
             batch_size,
             ranges_to_files,
@@ -1516,13 +1852,13 @@ impl ScalarIndex for BTreeIndex {
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
-                .pages_eq(&OrderableScalarValue(val.clone())),
+                .pages_eq(&OrderableScalarValue(val.clone()))?,
             SargableQuery::Range(start, end) => self
                 .page_lookup
                 .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
             SargableQuery::IsIn(values) => self
                 .page_lookup
-                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
+                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone())))?,
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::invalid_input(
                     "full text search is not supported for BTree index, build a inverted index for it",
@@ -2752,9 +3088,13 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        BTreeLookup, DEFAULT_BTREE_BATCH_SIZE, Matches, OrderableScalarValue,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
+
+    fn osv(v: i32) -> OrderableScalarValue {
+        OrderableScalarValue(ScalarValue::Int32(Some(v)))
+    }
 
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -2806,6 +3146,389 @@ mod tests {
             dict("a", DataType::Int16).cmp(&OrderableScalarValue(ScalarValue::Null)),
             Ordering::Greater
         );
+    }
+
+    /// Exercises the native byte path of `candidate_pages_for_values` for every
+    /// byte-like column type (e.g. UUID columns stored as `FixedSizeBinary`).
+    #[test]
+    fn test_btree_lookup_pages_eq_bytes() {
+        use arrow_array::{
+            ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+            RecordBatch, UInt32Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        // 2-byte big-endian keys, so lexicographic byte order matches numeric
+        // order. Same layout as the int test: page 0 is a null-min straddle,
+        // pages 2 and 3 share `min` 20, and 35 falls in a gap.
+        fn be(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+        let mins = [None, Some(10u16), Some(20), Some(20), Some(40)];
+        let maxs = [Some(5u16), Some(20), Some(20), Some(30), Some(50)];
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+
+        let assert_byte_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(u16) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+
+                let eq = |v: u16| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+
+                // IN merges and dedups across values.
+                let mut in_pages: Vec<u32> = lookup
+                    .pages_in([5u16, 15].into_iter().map(|v| OrderableScalarValue(sv(v))))
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.page_id())
+                    .collect();
+                in_pages.sort_unstable();
+                assert_eq!(in_pages, vec![0, 1]);
+            };
+
+        let fsb = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    arr.iter().copied().map(|o| o.map(be)),
+                    2,
+                )
+                .unwrap(),
+            )
+        };
+        assert_byte_lookup(fsb(&mins), fsb(&maxs), &|v| {
+            ScalarValue::FixedSizeBinary(2, Some(be(v).to_vec()))
+        });
+
+        let bin = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(BinaryArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| be(v).to_vec())),
+            ))
+        };
+        assert_byte_lookup(bin(&mins), bin(&maxs), &|v| {
+            ScalarValue::Binary(Some(be(v).to_vec()))
+        });
+
+        let lbin = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeBinaryArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| be(v).to_vec())),
+            ))
+        };
+        assert_byte_lookup(lbin(&mins), lbin(&maxs), &|v| {
+            ScalarValue::LargeBinary(Some(be(v).to_vec()))
+        });
+
+        // `LargeUtf8` over zero-padded decimal strings, whose lexicographic order
+        // matches the numeric order of the keys.
+        let lstr = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeStringArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| format!("{v:02}"))),
+            ))
+        };
+        assert_byte_lookup(lstr(&mins), lstr(&maxs), &|v| {
+            ScalarValue::LargeUtf8(Some(format!("{v:02}")))
+        });
+    }
+
+    /// Exercises the physical-type reinterpret path: temporal columns (`Date32`
+    /// over `i32`, `Timestamp` over `i64`) are compared through the integer native
+    /// path without a dedicated per-type branch.
+    #[test]
+    fn test_btree_lookup_pages_eq_temporal() {
+        use arrow_array::{
+            ArrayRef, Date32Array, RecordBatch, TimestampMicrosecondArray, UInt32Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+
+        let assert_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(i64) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+                let eq = |v: i64| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+            };
+
+        // Timestamp (i64-backed) → Int64 native path.
+        assert_lookup(
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::TimestampMicrosecond(Some(v), None),
+        );
+
+        // Date32 (i32-backed) → Int32 native path.
+        assert_lookup(
+            Arc::new(Date32Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Date32Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Date32(Some(v as i32)),
+        );
+    }
+
+    /// Exercises the NULL paths of the lookup directly: `pages_eq(NULL)` and
+    /// `pages_in` with a NULL in the value list (and a NULL-only list), including
+    /// the partial-null (`Some`) vs entirely-null (`All`) page classification.
+    #[test]
+    fn test_btree_lookup_pages_null() {
+        // Page 0 is entirely null (null max -> All); page 1 is a partial-null
+        // straddle (max 5, null_count > 0 -> Some); page 2 also carries a null.
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [None, Some(5), Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [3, 2, 1, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.all_null_pages, vec![0]);
+        assert_eq!(lookup.null_pages, vec![1, 2]);
+
+        // pages_eq(NULL) short-circuits to the null pages: partial-null pages are
+        // `Some`, the entirely-null page is `All`.
+        assert_eq!(
+            lookup
+                .pages_eq(&OrderableScalarValue(ScalarValue::Int32(None)))
+                .unwrap(),
+            vec![Matches::Some(1), Matches::Some(2), Matches::All(0)]
+        );
+
+        let in_ids = |vals: Vec<Option<i32>>| {
+            let mut p: Vec<u32> = lookup
+                .pages_in(
+                    vals.into_iter()
+                        .map(|v| OrderableScalarValue(ScalarValue::Int32(v))),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        // Baseline: a non-null value only -> just its value page.
+        assert_eq!(in_ids(vec![Some(45)]), vec![4]);
+        // A NULL in the list unions in every null page (0, 1, 2).
+        assert_eq!(in_ids(vec![Some(45), None]), vec![0, 1, 2, 4]);
+        // A NULL-only list (empty non-null set) returns exactly the null pages.
+        assert_eq!(in_ids(vec![None]), vec![0, 1, 2]);
+    }
+
+    /// A 0-row page_lookup batch (an index over an empty dataset) must yield no
+    /// candidates for any query rather than panicking on the binary-search bounds.
+    #[test]
+    fn test_btree_lookup_empty_batch() {
+        use arrow_array::RecordBatch;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("page_idx", DataType::UInt32, false),
+        ]));
+        let lookup = BTreeLookup::try_new(RecordBatch::new_empty(schema)).unwrap();
+        assert_eq!(lookup.search_start, 0);
+        assert!(lookup.null_pages.is_empty());
+        assert!(lookup.all_null_pages.is_empty());
+
+        assert!(lookup.pages_eq(&osv(5)).unwrap().is_empty());
+        assert!(lookup.pages_in([osv(5)]).unwrap().is_empty());
+        assert!(
+            lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(0)),
+                    std::ops::Bound::Included(&osv(100)),
+                ))
+                .is_empty()
+        );
+        assert!(lookup.pages_null().is_empty());
+    }
+
+    /// A straddle page (null `min`, non-null `max`) can sort ahead of an entirely-
+    /// null page within the leading NULL-`min` group. When it does, `search_start`
+    /// points at the straddle and the all-null page falls inside the forward-scan
+    /// window, so both the equality and range scans must skip it (it matches only
+    /// IS NULL).
+    #[test]
+    fn test_btree_lookup_skips_all_null_page_in_scan_window() {
+        // Page 0: straddle (null min, max 5). Page 1: entirely null (null min/max).
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [Some(5), None, Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [2, 3, 0, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.search_start, 0); // straddle page 0 has a non-null max
+        assert_eq!(lookup.all_null_pages, vec![1]);
+        assert_eq!(lookup.null_pages, vec![0]);
+
+        // Equality for 5 peeks left across the all-null page 1 (index 1, inside the
+        // scan window) and must skip it, reaching only the straddle page 0.
+        assert_eq!(
+            lookup
+                .pages_eq(&osv(5))
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        // The same all-null page is invisible to the range path: page 0 (straddle)
+        // is a partial match, pages 2-4 are fully covered.
+        let mut between = lookup.pages_between((
+            std::ops::Bound::Included(&osv(0)),
+            std::ops::Bound::Included(&osv(100)),
+        ));
+        between.sort_by_key(|m| m.page_id());
+        assert_eq!(
+            between,
+            vec![
+                Matches::Some(0),
+                Matches::All(2),
+                Matches::All(3),
+                Matches::All(4),
+            ]
+        );
+    }
+
+    /// The batched `pages_in` must select exactly the same candidate pages as
+    /// resolving each value independently through `pages_eq` (the pre-batching
+    /// behavior), across page-boundary values, gaps, duplicates, and NULLs.
+    #[test]
+    fn test_btree_lookup_pages_in_matches_per_value() {
+        // Page 0 straddles the NULL boundary, pages 2 and 3 share a min, and there
+        // is a gap between pages 3 and 4.
+        let batch = record_batch!(
+            ("min", Int32, [None, Some(10), Some(20), Some(20), Some(40)]),
+            (
+                "max",
+                Int32,
+                [Some(5), Some(20), Some(20), Some(30), Some(50)]
+            ),
+            ("null_count", UInt32, [2, 0, 0, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+
+        let values = vec![
+            Some(-3),
+            Some(5),
+            Some(10),
+            Some(15),
+            Some(20),
+            Some(20), // duplicate
+            Some(35), // gap
+            Some(50),
+            Some(99),
+            None,
+        ];
+
+        let mut per_value: Vec<u32> = values
+            .iter()
+            .flat_map(|v| {
+                lookup
+                    .pages_eq(&OrderableScalarValue(ScalarValue::Int32(*v)))
+                    .unwrap()
+            })
+            .map(|m| m.page_id())
+            .collect();
+        per_value.sort_unstable();
+        per_value.dedup();
+
+        let batched: Vec<u32> = lookup
+            .pages_in(
+                values
+                    .iter()
+                    .map(|v| OrderableScalarValue(ScalarValue::Int32(*v))),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|m| m.page_id())
+            .collect();
+
+        assert_eq!(batched, per_value);
     }
 
     #[tokio::test]
@@ -3964,6 +4687,117 @@ mod tests {
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![0], "Should report row 0 as null");
             }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    /// An IN list spanning many pages, with and without a NULL in the list, must
+    /// produce exactly the same mask as evaluating the predicate brute-force over
+    /// the searched pages (candidate pages plus null pages).
+    #[tokio::test]
+    async fn test_btree_is_in_multi_page_with_null() {
+        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_core::utils::mask::NullableRowAddrSet;
+
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 50 nulls then 0..400 in training order (nulls first), with a page size
+        // of 50: page 0 is entirely null and pages 1-8 hold 50 values each.
+        const PAGE_SIZE: usize = 50;
+        let values: Vec<Option<i32>> = vec![None; PAGE_SIZE]
+            .into_iter()
+            .chain((0..400).map(Some))
+            .collect();
+        let row_ids: Vec<u64> = (0..values.len() as u64).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(values.clone())),
+                Arc::new(UInt64Array::from(row_ids.clone())),
+            ],
+        )
+        .unwrap();
+        let stream = stream::once(futures::future::ok(batch));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        super::train_btree_index(stream, store.as_ref(), PAGE_SIZE as u64, None, None)
+            .await
+            .unwrap();
+
+        let index = super::BTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.page_lookup.all_null_pages, vec![0]);
+        assert_eq!(index.page_lookup.batch.num_rows(), 9);
+
+        // 5, 105/106, and 333 hit three distinct pages; 999 hits none.
+        let in_values = [5i32, 105, 106, 333, 999];
+
+        // Brute-force expectation over the raw rows. A page is searched when its
+        // [min, max] range could contain one of the values or when it contains
+        // nulls (`search` adds null pages for three-valued logic). Within a
+        // searched page the predicate is evaluated row by row: matches are TRUE,
+        // null values are NULL, and non-matches are NULL iff the list has a NULL.
+        let expected = |list_has_null: bool| {
+            let pages: Vec<&[Option<i32>]> = values.chunks(PAGE_SIZE).collect();
+            let searched: Vec<bool> = pages
+                .iter()
+                .map(|page| {
+                    let non_null: Vec<i32> = page.iter().flatten().copied().collect();
+                    let has_nulls = non_null.len() < page.len();
+                    let covers_value = !non_null.is_empty()
+                        && in_values.iter().any(|v| {
+                            *non_null.iter().min().unwrap() <= *v
+                                && *v <= *non_null.iter().max().unwrap()
+                        });
+                    has_nulls || covers_value
+                })
+                .collect();
+
+            let mut true_rows = Vec::new();
+            let mut null_rows = Vec::new();
+            for (row_id, value) in row_ids.iter().zip(values.iter()) {
+                if !searched[*row_id as usize / PAGE_SIZE] {
+                    continue;
+                }
+                match value {
+                    Some(v) if in_values.contains(v) => true_rows.push(*row_id),
+                    Some(_) if list_has_null => null_rows.push(*row_id),
+                    Some(_) => {}
+                    None => null_rows.push(*row_id),
+                }
+            }
+            NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&true_rows),
+                RowAddrTreeMap::from_iter(&null_rows),
+            )
+        };
+
+        let in_list: Vec<ScalarValue> = in_values
+            .iter()
+            .map(|v| ScalarValue::Int32(Some(*v)))
+            .collect();
+
+        let query = SargableQuery::IsIn(in_list.clone());
+        match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(actual) => assert_eq!(actual, expected(false)),
+            _ => panic!("Expected Exact search result"),
+        }
+
+        let mut in_list_with_null = in_list;
+        in_list_with_null.push(ScalarValue::Int32(None));
+        let query = SargableQuery::IsIn(in_list_with_null);
+        match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(actual) => assert_eq!(actual, expected(true)),
             _ => panic!("Expected Exact search result"),
         }
     }
