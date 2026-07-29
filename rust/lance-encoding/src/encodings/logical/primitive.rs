@@ -23,8 +23,11 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
@@ -5402,13 +5405,36 @@ impl PrimitiveStructuralEncoder {
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
-            // An empty dictionary can only contain null keys. Removing their validity would turn
-            // key 0 into a valid index into an empty values array.
+            // An empty dictionary can only contain null keys. Removing their validity would
+            // turn key 0 into a valid index into an empty values array, while keeping the
+            // validity pushes a null entry into the dictionary values when pages are merged
+            // (`arrow_dictionary_to_data_block`), producing a values block the block
+            // compressors cannot encode (`create_block_compressor` supports only fully-valid
+            // fixed/variable width values). The rows' nullness is already recorded in repdef
+            // above, so rebuild the array as zeroed valid keys pointing at a single zeroed
+            // placeholder value that decoding never surfaces.
             if array
                 .as_any_dictionary_opt()
                 .is_some_and(|dictionary| dictionary.values().is_empty())
             {
-                return Ok(array);
+                let DataType::Dictionary(key_type, value_type) = array.data_type() else {
+                    unreachable!("as_any_dictionary_opt returned Some for a non-dictionary type")
+                };
+                // `new_null_array` zeroes the underlying buffers, so dropping the null
+                // bitmap yields a fully-valid array of zero values ("" / 0).
+                let zeroed = |data_type: &DataType, len: usize| -> Result<ArrayData> {
+                    Ok(new_null_array(data_type, len)
+                        .to_data()
+                        .into_builder()
+                        .nulls(None)
+                        .build()?)
+                };
+                let rebuilt = zeroed(key_type, array.len())?
+                    .into_builder()
+                    .data_type(array.data_type().clone())
+                    .child_data(vec![zeroed(value_type, 1)?])
+                    .build()?;
+                return Ok(make_array(rebuilt));
             }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
@@ -5548,6 +5574,29 @@ mod tests {
 
         check_round_trip_encoding_of_data(vec![dictionary], &TestCases::default(), HashMap::new())
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_round_trip() {
+        use arrow_array::builder::StringDictionaryBuilder;
+        use arrow_array::types::Int32Type;
+
+        let mut valued = StringDictionaryBuilder::<Int32Type>::new();
+        valued.append_value("a");
+        for _ in 0..7 {
+            valued.append_null();
+        }
+        let valued = Arc::new(valued.finish()) as ArrayRef;
+
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let all_null = new_null_array(&data_type, 8);
+
+        check_round_trip_encoding_of_data(
+            vec![valued, all_null],
+            &TestCases::default(),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
