@@ -5743,11 +5743,10 @@ mod tests {
     /// all-null chunk into the page must not add a dictionary entry (that would widen
     /// the stored indices past the declared key type and corrupt valid rows on decode).
     ///
-    /// Restricted to the dense u16 encoding because full narrow dictionaries hit
-    /// pre-existing failures elsewhere, even without an all-null chunk: the legacy
-    /// array encoding's null normalization appends a null dictionary entry (overflowing
-    /// the key type), and the constant-capable structural encodings panic in scalar
-    /// extraction (`MutableArrayData` rejects an at-capacity dictionary).
+    /// Restricted to 2.1+ because full narrow dictionaries hit a pre-existing
+    /// failure elsewhere, even without an all-null chunk: the legacy array
+    /// encoding's null normalization appends a null dictionary entry (overflowing
+    /// the key type).
     #[rstest::rstest]
     #[case::utf8(mixed_full_int8_utf8_dictionary())]
     #[case::boolean(mixed_full_int8_boolean_dictionary())]
@@ -5760,7 +5759,6 @@ mod tests {
             Some(expected),
             &TestCases::default()
                 .with_min_file_version(LanceFileVersion::V2_1)
-                .with_max_file_version(LanceFileVersion::V2_1)
                 .without_validation(),
             HashMap::new(),
         )
