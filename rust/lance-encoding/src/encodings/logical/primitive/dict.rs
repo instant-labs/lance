@@ -16,7 +16,7 @@ use arrow_array::{
         UInt32Type, UInt64Type,
     },
 };
-use arrow_buffer::ArrowNativeType;
+use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
 use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
@@ -80,6 +80,76 @@ fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
     )?;
 
     Ok(Arc::new(DictionaryArray::new(keys, values)) as Arc<dyn Array>)
+}
+
+fn clear_out_of_range_null_keys_impl<K: ArrowDictionaryKeyType>(
+    array: Arc<dyn Array>,
+) -> Result<Arc<dyn Array>> {
+    let dict_array = array.as_dictionary_opt::<K>().expect_ok()?;
+    let keys = dict_array.keys();
+    let Some(nulls) = keys.nulls() else {
+        return Ok(array);
+    };
+    // An empty dictionary has no key a null slot could point at.  `do_flush`
+    // merges those chunks into a sibling page instead.
+    let num_values = dict_array.values().len();
+    if num_values == 0 {
+        return Ok(array);
+    }
+
+    let out_of_range = |key: &K::Native| key.to_usize().is_none_or(|key| key >= num_values);
+    let has_out_of_range_null_key = nulls
+        .iter()
+        .zip(keys.values())
+        .any(|(is_valid, key)| !is_valid && out_of_range(key));
+    if !has_out_of_range_null_key {
+        return Ok(array);
+    }
+
+    let cleared: ScalarBuffer<K::Native> = nulls
+        .iter()
+        .zip(keys.values())
+        .map(|(is_valid, key)| match is_valid {
+            true => *key,
+            false => K::Native::default(),
+        })
+        .collect();
+    let keys = PrimitiveArray::<K>::new(cleared, Some(nulls.clone()));
+    Ok(Arc::new(DictionaryArray::<K>::try_new(
+        keys,
+        dict_array.values().clone(),
+    )?))
+}
+
+/// Arrow allows a null slot of a dictionary array to hold any key, and
+/// `ArrayData` validation skips those slots.  The encoder drops the key validity
+/// and then revalidates every key, so a key Arrow accepted becomes fatal.
+///
+/// `concat` produces such keys whenever it merges a valued chunk with an
+/// all-null one: it offsets the second chunk's keys by the first dictionary's
+/// length, and an empty second dictionary leaves them one past the end.  Point
+/// them at a real entry before the validity goes away.  Rep-def already carries
+/// the true nullness, so decoding never surfaces the substitute.
+pub fn clear_out_of_range_null_keys(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+    match array.data_type() {
+        DataType::Dictionary(key_type, _) => match key_type.as_ref() {
+            DataType::UInt8 => clear_out_of_range_null_keys_impl::<UInt8Type>(array),
+            DataType::UInt16 => clear_out_of_range_null_keys_impl::<UInt16Type>(array),
+            DataType::UInt32 => clear_out_of_range_null_keys_impl::<UInt32Type>(array),
+            DataType::UInt64 => clear_out_of_range_null_keys_impl::<UInt64Type>(array),
+            DataType::Int8 => clear_out_of_range_null_keys_impl::<Int8Type>(array),
+            DataType::Int16 => clear_out_of_range_null_keys_impl::<Int16Type>(array),
+            DataType::Int32 => clear_out_of_range_null_keys_impl::<Int32Type>(array),
+            DataType::Int64 => clear_out_of_range_null_keys_impl::<Int64Type>(array),
+            _ => Err(Error::not_supported_source(
+                format!("Unsupported dictionary key type: {}", key_type).into(),
+            )),
+        },
+        _ => Err(Error::internal(format!(
+            "Data type is not a dictionary: {}",
+            array.data_type()
+        ))),
+    }
 }
 
 /// In Arrow a dictionary array can have nulls in two different places:

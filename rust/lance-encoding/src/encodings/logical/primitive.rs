@@ -5527,6 +5527,7 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 array = dict::normalize_dict_nulls(array)?;
+                array = dict::clear_out_of_range_null_keys(array)?;
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -5617,11 +5618,13 @@ mod tests {
     };
     use crate::version::LanceFileVersion;
     use arrow_array::{
-        ArrayRef, BooleanArray, DictionaryArray, Int8Array, PrimitiveArray, StringArray,
+        Array, ArrayRef, BooleanArray, DictionaryArray, Int8Array, PrimitiveArray, StringArray,
         builder::StringDictionaryBuilder,
+        cast::AsArray,
         new_null_array,
         types::{ArrowDictionaryKeyType, Int8Type, Int32Type},
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -5733,6 +5736,52 @@ mod tests {
     #[case::sliced_int8(mixed_sliced_int8_dictionary())]
     #[tokio::test]
     async fn test_mixed_valued_and_all_null_dictionary_round_trip(
+        #[case] dictionaries: Vec<ArrayRef>,
+    ) {
+        check_round_trip_encoding_of_data(dictionaries, &TestCases::default(), HashMap::new())
+            .await;
+    }
+
+    /// A batch coalescer concatenates the chunks before the encoder sees them, so
+    /// the all-null chunk arrives already merged into the valued one. `concat`
+    /// offsets its keys by the first dictionary's length, which leaves them one
+    /// past the end of the merged dictionary.
+    fn concatenated_valued_and_all_null_dictionary() -> Vec<ArrayRef> {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let valued = valued_dictionary::<Int32Type>();
+        let all_null = new_null_array(&data_type, 8);
+        let merged = arrow_select::concat::concat(&[valued.as_ref(), all_null.as_ref()]).unwrap();
+
+        let merged_keys = merged.as_dictionary::<Int32Type>().keys();
+        assert!(
+            merged_keys
+                .values()
+                .iter()
+                .enumerate()
+                .any(|(index, key)| merged_keys.is_null(index)
+                    && *key as usize >= merged.as_dictionary::<Int32Type>().values().len()),
+            "the concatenated chunk should carry an out-of-range key in a null slot"
+        );
+        vec![merged]
+    }
+
+    /// The same shape built by hand, so the case survives a change to `concat`'s
+    /// merge heuristic. Arrow accepts the array because its validation skips the
+    /// key of a null slot.
+    fn hand_built_out_of_range_null_keys() -> Vec<ArrayRef> {
+        let keys = PrimitiveArray::<Int32Type>::new(
+            vec![0, 7, 7].into(),
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        vec![Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef]
+    }
+
+    #[rstest::rstest]
+    #[case::concatenated(concatenated_valued_and_all_null_dictionary())]
+    #[case::hand_built(hand_built_out_of_range_null_keys())]
+    #[tokio::test]
+    async fn test_out_of_range_null_keys_dictionary_round_trip(
         #[case] dictionaries: Vec<ArrayRef>,
     ) {
         check_round_trip_encoding_of_data(dictionaries, &TestCases::default(), HashMap::new())
