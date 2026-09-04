@@ -2421,7 +2421,7 @@ mod tests {
     };
     use arrow_array::{RecordBatch, record_batch};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -9127,5 +9127,147 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         for i in 0..rows_per_frag {
             assert_eq!(values.value(i), 888.0, "row {i} should have value_a=888.0");
         }
+    }
+
+    /// A source column that holds NULL on every row must not make the merge
+    /// write nulls into a different, non-nullable column.
+    ///
+    /// This is the shape of an ETL batch that adds a column: the new column is
+    /// legitimately NULL on every row until a later pass fills some of them.
+    ///
+    /// The dataset holds 5 columns and 8 rows. The source holds the same 5
+    /// columns and the same 8 `id` values, so every source row matches a target
+    /// row and the merge only updates:
+    ///
+    /// | # | column    | type                    | nullable | target    | source       |
+    /// | - | --------- | ----------------------- | -------- | --------- | ------------ |
+    /// | 0 | `id`      | `Int32`                 | no       | `0..8`    | `0..8`       |
+    /// | 1 | `name`    | `Utf8`                  | yes      | populated | populated    |
+    /// | 2 | `markets` | `List<Utf8>`            | yes      | populated | populated    |
+    /// | 3 | `score`   | `null_column_type`      | yes      | populated | **all NULL** |
+    /// | 4 | `payload` | `FixedSizeList<f32, 4>` | **no**   | populated | populated    |
+    ///
+    /// `swap_source_order` exchanges `score` and `payload` in the *source*
+    /// batch only, so the source presents its columns in an order the dataset
+    /// schema does not use. A caller may do that, because the merge matches
+    /// columns by name, so the write must follow the name and not the position.
+    /// A write that follows the position puts `score` in the `payload` slot.
+    /// `payload` rejects NULL at the writer, so the merge then fails on
+    /// `payload` although `score` is the only column that carries NULL.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_all_null_source_column(
+        #[values(DataType::Float64, DataType::Timestamp(TimeUnit::Second, None))]
+        null_column_type: DataType,
+        #[values(false, true)] swap_source_order: bool,
+        #[values(WhenMatched::UpdateAll, WhenMatched::UpdateIf("true".into()))]
+        when_matched: WhenMatched,
+        // `Keep` joins with `JoinType::Inner`, `Delete` with `JoinType::Left`.
+        #[values(WhenNotMatchedBySource::Keep, WhenNotMatchedBySource::Delete)]
+        when_not_matched_by_source: WhenNotMatchedBySource,
+    ) {
+        const ROWS: usize = 8;
+
+        let field = |name: &str| match name {
+            "id" => Field::new("id", DataType::Int32, false),
+            "name" => Field::new("name", DataType::Utf8, true),
+            "markets" => Field::new(
+                "markets",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            "score" => Field::new("score", null_column_type.clone(), true),
+            _ => Field::new(
+                "payload",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        };
+        // Both candidate types for `score` cast from Int64, which populates the
+        // target side without a per-type builder.
+        let column = |name: &str, all_null: bool| -> arrow_array::ArrayRef {
+            match name {
+                "id" => Arc::new(Int32Array::from((0..ROWS as i32).collect::<Vec<_>>())),
+                "name" => Arc::new(StringArray::from(
+                    (0..ROWS).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+                )),
+                "markets" => {
+                    let mut builder = ListBuilder::new(StringBuilder::new());
+                    for i in 0..ROWS {
+                        builder.values().append_value(format!("m{i}"));
+                        builder.append(true);
+                    }
+                    Arc::new(builder.finish())
+                }
+                "score" if all_null => arrow_array::new_null_array(&null_column_type, ROWS),
+                "score" => arrow_cast::cast(
+                    &Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()),
+                    &null_column_type,
+                )
+                .unwrap(),
+                _ => Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(
+                            (0..(ROWS * 4) as i32).map(|v| v as f32).collect::<Vec<_>>(),
+                        ),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            }
+        };
+        let batch = |order: &[&str], all_null: bool| {
+            let schema = Arc::new(Schema::new(
+                order.iter().map(|name| field(name)).collect::<Vec<_>>(),
+            ));
+            let columns = order
+                .iter()
+                .map(|name| column(name, all_null))
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(schema, columns).unwrap()
+        };
+
+        let dataset_order = ["id", "name", "markets", "score", "payload"];
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![batch(&dataset_order, false)])
+                .await
+                .unwrap(),
+        );
+
+        let source_order: [&str; 5] = if swap_source_order {
+            ["id", "name", "markets", "payload", "score"]
+        } else {
+            dataset_order
+        };
+        let source_batch = batch(&source_order, true);
+        let source_schema = source_batch.schema();
+        let source = Box::new(RecordBatchIterator::new([Ok(source_batch)], source_schema));
+
+        // Update the 8 matched rows with the source values, and do nothing
+        // else: the source has no new `id`, so `DoNothing` inserts nothing, and
+        // the target has no `id` that the source omits, so neither
+        // `WhenNotMatchedBySource` value deletes anything.
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+        let (new_dataset, stats) = job.execute_reader(source).await.unwrap();
+
+        assert_eq!(stats.num_updated_rows, ROWS as u64);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(stats.num_deleted_rows, 0);
+
+        // The update must take the source value for every column: `payload`
+        // keeps its values, and `score` becomes NULL on every row.
+        let merged = new_dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(merged.num_rows(), ROWS);
+        assert_eq!(merged["payload"].null_count(), 0);
+        assert_eq!(merged["name"].null_count(), 0);
+        assert_eq!(merged["markets"].null_count(), 0);
+        assert_eq!(merged["score"].null_count(), ROWS);
     }
 }
