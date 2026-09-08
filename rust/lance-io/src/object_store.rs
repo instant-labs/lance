@@ -1501,8 +1501,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "aws")]
     #[tokio::test]
-    async fn test_cloud_paths() {
+    async fn test_cloud_paths_aws() {
         let uri = "s3://bucket/foo.lance";
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
         assert_eq!(store.scheme, "s3");
@@ -1513,13 +1514,21 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "s3");
         assert_eq!(path.to_string(), "foo.lance");
+    }
 
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn test_cloud_paths_gcp() {
         let (store, path) = ObjectStore::from_uri("gs://bucket/foo.lance")
             .await
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+    }
 
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_cloud_paths_azure() {
         let (store, path) =
             ObjectStore::from_uri("abfss://filesystem@account.dfs.core.windows.net/foo.lance")
                 .await
@@ -1560,25 +1569,36 @@ mod tests {
         assert_eq!(store.block_size, 1024);
     }
 
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_block_size_used_aws() {
+        test_block_size_used_test_helper("s3://bucket/foo.lance", None, 64 * 1024).await;
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn test_block_size_used_gcp() {
+        test_block_size_used_test_helper("gs://bucket/foo.lance", None, 64 * 1024).await;
+    }
+
+    #[cfg(feature = "azure")]
     #[rstest]
-    #[case("s3://bucket/foo.lance", None)]
-    #[case("gs://bucket/foo.lance", None)]
-    #[case("az://account/bucket/foo.lance",
-      Some(HashMap::from([
+    #[case::az("az://account/bucket/foo.lance",
+      HashMap::from([
             (String::from("account_name"), String::from("account")),
             (String::from("container_name"), String::from("container"))
-           ])))]
-    #[case("abfss://filesystem@account.dfs.core.windows.net/foo.lance",
-      Some(HashMap::from([
+           ]))]
+    #[case::abfss("abfss://filesystem@account.dfs.core.windows.net/foo.lance",
+      HashMap::from([
             (String::from("account_name"), String::from("account")),
             (String::from("container_name"), String::from("filesystem"))
-           ])))]
+           ]))]
     #[tokio::test]
-    async fn test_block_size_used_cloud(
+    async fn test_block_size_used_azure(
         #[case] uri: &str,
-        #[case] storage_options: Option<HashMap<String, String>>,
+        #[case] storage_options: HashMap<String, String>,
     ) {
-        test_block_size_used_test_helper(uri, storage_options, 64 * 1024).await;
+        test_block_size_used_test_helper(uri, Some(storage_options), 64 * 1024).await;
     }
 
     #[rstest]

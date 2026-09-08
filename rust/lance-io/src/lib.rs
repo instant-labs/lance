@@ -1,5 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+//! I/O and object store support for Lance.
+//!
+//! # TLS crypto provider
+//!
+//! The default `tls-no-provider` feature builds the opendal HTTP transport against
+//! rustls without a built-in crypto provider, which keeps `aws-lc-rs` and its cmake
+//! build dependency out of the build. In exchange, the application must install a
+//! process-wide rustls [`CryptoProvider`] before it builds the first object store,
+//! or reqwest panics. `ring` is already in the dependency graph, so one line is
+//! enough:
+//!
+//! ```text
+//! rustls::crypto::ring::default_provider()
+//!     .install_default()
+//!     .expect("install rustls crypto provider");
+//! ```
+//!
+//! Build with `--no-default-features --features gcp,tls-aws-lc-rs` to get the
+//! upstream behavior, where reqwest supplies `aws-lc-rs` itself.
+//!
+//! [`CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
 #![recursion_limit = "512"]
 use std::{
     ops::{Range, RangeFrom, RangeFull, RangeTo},

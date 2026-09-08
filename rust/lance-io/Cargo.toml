@@ -67,7 +67,7 @@ name = "scheduler"
 harness = false
 
 [features]
-default = ["aws", "azure", "gcp", "tls-aws-lc-rs"]
+default = ["gcp", "tls-no-provider"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
@@ -88,7 +88,10 @@ goosefs = ["dep:opendal", "opendal/services-goosefs", "dep:object_store_opendal"
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
-# Granular opendal transports (not the reqwest-rustls-* aliases, which also pull aws-lc-rs); tls-no-provider needs an app-installed rustls provider.
+# Granular opendal transports (not the reqwest-rustls-* aliases, which also pull aws-lc-rs).
+# tls-no-provider is the default here: it keeps aws-lc-rs out of the build, but the
+# application must install a rustls CryptoProvider before the first object store is
+# built, or reqwest panics. See the crate docs.
 tls-aws-lc-rs = ["opendal?/http-transport-reqwest-rustls"]
 tls-no-provider = ["opendal?/http-transport-reqwest-rustls-no-provider"]
 tos-test = ["tos"]

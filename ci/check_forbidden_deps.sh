@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# Lance promises that non-AWS cloud builds can be built without aws-lc-rs.
-# Consumers building slim images for a single backend (e.g. GCS-only) rely on
-# this: aws-lc-rs compiles C/assembly through its cmake build dependency,
-# which bloats builds, complicates cross-compilation, and forces a second
-# crypto provider on deployments that standardize on ring. This script
-# enforces the promise by resolving each non-AWS backend under the
-# provider-neutral TLS feature (tls-no-provider) and failing if aws-lc-rs or
-# cmake appears.
+# This fork promises that a default build carries no aws-lc-rs, and that any
+# non-AWS backend can be built without it. Consumers building slim images for a
+# single backend (e.g. GCS-only) rely on this: aws-lc-rs compiles C/assembly
+# through its cmake build dependency, which bloats builds, complicates
+# cross-compilation, and forces a second crypto provider on deployments that
+# standardize on ring. This script enforces the promise by resolving the
+# default features, and each non-AWS backend under the provider-neutral TLS
+# feature (tls-no-provider), and failing if aws-lc-rs or cmake appears.
 #
 # It checks the FUNCTIONAL configuration (backend + tls-no-provider), not the
 # bare backend: opendal's HTTP transport is opt-in, so a bare backend has no
@@ -57,6 +57,10 @@ check() {
     fi
     echo "ok: $desc is free of {${FORBIDDEN[*]}} and has an HTTP transport"
 }
+
+check "lance-io (default)" --manifest-path rust/lance-io/Cargo.toml
+check "lance (default)" --manifest-path rust/lance/Cargo.toml
+check "lance-namespace-impls (default)" --manifest-path rust/lance-namespace-impls/Cargo.toml
 
 check "lance-io (gcp, tls-no-provider)" --manifest-path rust/lance-io/Cargo.toml --no-default-features --features gcp,tls-no-provider
 check "lance-io (azure, tls-no-provider)" --manifest-path rust/lance-io/Cargo.toml --no-default-features --features azure,tls-no-provider
