@@ -2263,6 +2263,7 @@ mod tests {
     #[cfg(feature = "gcp")]
     #[tokio::test]
     async fn test_cloud_paths_gcp() {
+        crate::testing::install_crypto_provider();
         let (store, path) = ObjectStore::from_uri("gs://bucket/foo.lance")
             .await
             .unwrap();
@@ -2286,6 +2287,7 @@ mod tests {
         storage_options: Option<HashMap<String, String>>,
         default_expected_block_size: usize,
     ) {
+        crate::testing::install_crypto_provider();
         // Test the default
         let registry = Arc::new(ObjectStoreRegistry::default());
         let accessor = storage_options

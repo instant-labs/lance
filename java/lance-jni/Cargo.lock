@@ -3712,6 +3712,7 @@ dependencies = [
  "reqsign-core",
  "reqsign-file-read-tokio",
  "reqsign-google",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -4559,7 +4560,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1796bc93603f78c5760a69f2d58badc9618d22adade0a95385bb2adbae4eb94"
 dependencies = [
  "async-trait",
- "aws-lc-rs",
  "base64 0.23.0",
  "bytes",
  "chrono",
@@ -4578,6 +4578,7 @@ dependencies = [
  "quick-xml",
  "rand 0.10.1",
  "reqwest 0.13.4",
+ "ring",
  "rustls-pki-types",
  "serde",
  "serde_json",

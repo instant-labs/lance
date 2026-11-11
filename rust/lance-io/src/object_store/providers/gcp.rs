@@ -533,6 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_account_application_credentials() {
+        crate::testing::install_crypto_provider();
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -586,6 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_account_respects_client_timeout() {
+        crate::testing::install_crypto_provider();
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
