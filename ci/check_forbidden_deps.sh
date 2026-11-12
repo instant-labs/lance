@@ -65,3 +65,4 @@ check "lance-namespace-impls (default)" --manifest-path rust/lance-namespace-imp
 check "lance-io (gcp, tls-no-provider)" --manifest-path rust/lance-io/Cargo.toml --no-default-features --features gcp,tls-no-provider
 check "lance-io (azure, tls-no-provider)" --manifest-path rust/lance-io/Cargo.toml --no-default-features --features azure,tls-no-provider
 check "lance-io (oss, tls-no-provider)" --manifest-path rust/lance-io/Cargo.toml --no-default-features --features oss,tls-no-provider
+check "lance-namespace-impls (rest, credential-vendor-gcp, credential-vendor-azure)" --manifest-path rust/lance-namespace-impls/Cargo.toml --features rest,credential-vendor-gcp,credential-vendor-azure

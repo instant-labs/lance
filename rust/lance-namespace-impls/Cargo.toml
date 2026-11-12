@@ -38,7 +38,9 @@ reqwest = { workspace = true, optional = true, features = [
     "gzip",
     "http2",
     "stream",
-    "rustls",
+    # reqwest/rustls links aws-lc-rs. The lance-io tls-* features pick the
+    # crypto provider of this reqwest build.
+    "rustls-no-provider",
     "query",
     "form",
 ] }
@@ -95,6 +97,8 @@ tempfile.workspace = true
 wiremock.workspace = true
 rstest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+# Gives the test HTTP clients a crypto provider.
+reqwest = { workspace = true, features = ["rustls"] }
 
 [[example]]
 name = "manifest_bench"
