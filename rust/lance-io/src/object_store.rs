@@ -3726,6 +3726,7 @@ mod tests {
             ("headers.x-ms-version".to_string(), "2023-11-03".to_string()),
             ("region".to_string(), "us-west-2".to_string()),
         ]));
+        #[cfg_attr(not(feature = "gcp"), allow(unused_variables))]
         let client_options = opts.client_options().unwrap();
 
         // Verify non-header keys are not consumed as headers by creating
